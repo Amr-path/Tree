@@ -1,6 +1,5 @@
-# Santa 2025 Christmas Tree Packing Solver v2.0
+#  2025 Tree Packing Solver v2.0
 
-Highly optimized solution for the Kaggle Santa 2025 competition.
 
 ## Key Improvements Over Baseline
 
