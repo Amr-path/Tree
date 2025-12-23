@@ -1,20 +1,30 @@
 """
-optimize.py - Highly optimized Simulated Annealing for Santa 2025
-Key improvements over baseline:
-- 5-10x more iterations
-- Better temperature schedule
-- Multiple move types
-- Adaptive step sizes
-- Multi-restart capability
+optimize.py - Hybrid optimizer for Santa 2025
+Key components:
+- Adaptive Simulated Annealing with dynamic cooling
+- Differential Evolution for global exploration (optional, SciPy-backed)
+- L-BFGS-B local refinement on dense cores
+- Multi-resolution stages with angular sweeps for rotation discovery
+- Multi-restart capability with structured perturbations
 """
 import math
 import random
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Iterable, Sequence
 from dataclasses import dataclass
+
+import numpy as np
+try:  # SciPy may not be available in some execution environments
+    from scipy.optimize import differential_evolution, minimize
+    SCIPY_AVAILABLE = True
+except ImportError:  # pragma: no cover - fallback path
+    differential_evolution = None
+    minimize = None
+    SCIPY_AVAILABLE = False
 
 from .geometry import (
     make_tree_polygon, bounding_square_side, has_collision,
-    compute_bounding_square_side, center_placements, placement_in_bounds
+    compute_bounding_square_side, center_placements, placement_in_bounds,
+    compute_bounding_box
 )
 
 @dataclass
@@ -39,6 +49,21 @@ class OptimizationConfig:
     
     # Multi-restart
     num_restarts: int = 1
+
+    # Advanced global/local hybrid controls
+    overlap_penalty: float = 25.0
+    de_maxiter: int = 35
+    de_popsize: int = 12
+    lbfgs_maxiter: int = 45
+    angular_sweep_steps: int = 16
+    rotation_sweep_range: float = 90.0
+    multi_resolution_levels: int = 3
+    multi_resolution_shrink: float = 0.72
+    max_de_trees: int = 36
+    annealing_multiplier: float = 1.4
+    use_differential_evolution: bool = True
+    use_lbfgs: bool = True
+    use_annealing: bool = True
     
     seed: int = 42
     
@@ -81,11 +106,235 @@ class OptimizationConfig:
         )
 
 
+def _flatten_solution(solution: Sequence[Tuple[float, float, float]], indices: Optional[Iterable[int]] = None) -> np.ndarray:
+    """Flatten solution into vector (x0,y0,a0,...)."""
+    if indices is None:
+        indices = range(len(solution))
+    data = []
+    for i in indices:
+        x, y, ang = solution[i]
+        data.extend([x, y, ang])
+    return np.asarray(data, dtype=float)
+
+
+def _unflatten_solution(
+    base_solution: Sequence[Tuple[float, float, float]],
+    vec: np.ndarray,
+    indices: Optional[Iterable[int]] = None
+) -> List[Tuple[float, float, float]]:
+    """Apply flattened vector onto base solution positions."""
+    sol = list(base_solution)
+    if indices is None:
+        indices = range(len(base_solution))
+    idx_list = list(indices)
+    for j, i in enumerate(idx_list):
+        sol[i] = (float(vec[3 * j]), float(vec[3 * j + 1]), float(vec[3 * j + 2]) % 360.0)
+    return sol
+
+
+def _collision_penalty(polys: List) -> float:
+    """Count collisions between polygons to build penalty term."""
+    penalty = 0.0
+    for i in range(len(polys)):
+        for j in range(i + 1, len(polys)):
+            if has_collision(polys[i], [polys[j]]):
+                penalty += 1.0
+    return penalty
+
+
+def _penalized_objective(
+    vec: np.ndarray,
+    base_solution: Sequence[Tuple[float, float, float]],
+    indices: Sequence[int],
+    config: OptimizationConfig
+) -> float:
+    """Objective function for continuous optimizers."""
+    candidate = _unflatten_solution(base_solution, vec, indices)
+    polys = [make_tree_polygon(x, y, ang) for x, y, ang in candidate]
+    side = bounding_square_side(polys)
+    penalty = _collision_penalty(polys)
+    return side + penalty * config.overlap_penalty
+
+
+def _select_dense_subset(solution: Sequence[Tuple[float, float, float]], k: int) -> List[int]:
+    """Pick a subset of trees closest to center to focus global search on dense core."""
+    if len(solution) <= k:
+        return list(range(len(solution)))
+    min_x, min_y, max_x, max_y = compute_bounding_box(solution)
+    center = np.array([(min_x + max_x) / 2, (min_y + max_y) / 2])
+    distances = [math.hypot(x - center[0], y - center[1]) for x, y, _ in solution]
+    return sorted(range(len(solution)), key=lambda i: distances[i])[:k]
+
+
+def _rotation_sweep(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    level: int = 0
+) -> List[Tuple[float, float, float]]:
+    """Perform local angular sweeps to find interlocking rotations."""
+    if not solution:
+        return solution
+    
+    step_scale = config.multi_resolution_shrink ** level
+    ang_range = config.rotation_sweep_range * step_scale
+    steps = max(4, int(config.angular_sweep_steps * step_scale))
+    improved = list(solution)
+    polys = [make_tree_polygon(x, y, a) for x, y, a in improved]
+    
+    for idx, (x, y, ang) in enumerate(improved):
+        best_ang = ang
+        best_side = bounding_square_side(polys)
+        
+        for delta in np.linspace(-ang_range, ang_range, steps):
+            candidate_ang = (ang + delta) % 360.0
+            new_poly = make_tree_polygon(x, y, candidate_ang)
+            others = polys[:idx] + polys[idx + 1:]
+            if has_collision(new_poly, others):
+                continue
+            polys[idx] = new_poly
+            side = bounding_square_side(polys)
+            if side < best_side:
+                best_side = side
+                best_ang = candidate_ang
+        polys[idx] = make_tree_polygon(x, y, best_ang)
+        improved[idx] = (x, y, best_ang)
+    return improved
+
+
+def _run_differential_evolution(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    level: int = 0
+) -> List[Tuple[float, float, float]]:
+    """Global search with Differential Evolution on a dense subset."""
+    n = len(solution)
+    if n == 0 or not config.use_differential_evolution or not SCIPY_AVAILABLE:
+        return solution
+    
+    subset = _select_dense_subset(solution, min(config.max_de_trees, n))
+    bounds = []
+    step_scale = config.multi_resolution_shrink ** level
+    limit = max(1.5, bounding_square_side([make_tree_polygon(x, y, a) for x, y, a in solution]) * 1.1)
+    for _ in subset:
+        bounds.extend([(-limit, limit), (-limit, limit), (0.0, 360.0)])
+    
+    def objective(vec):
+        return _penalized_objective(vec, solution, subset, config)
+    
+    result = differential_evolution(
+        objective,
+        bounds,
+        maxiter=max(10, int(config.de_maxiter * step_scale)),
+        popsize=config.de_popsize,
+        polish=False,
+        seed=config.seed + level
+    )
+    return _unflatten_solution(solution, result.x, subset)
+
+
+def _run_lbfgs(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    level: int = 0
+) -> List[Tuple[float, float, float]]:
+    """Local refinement using L-BFGS-B on the same dense subset."""
+    n = len(solution)
+    if n == 0 or not config.use_lbfgs or not SCIPY_AVAILABLE:
+        return solution
+    
+    subset = _select_dense_subset(solution, min(config.max_de_trees, n))
+    bounds = []
+    limit = max(1.5, bounding_square_side([make_tree_polygon(x, y, a) for x, y, a in solution]) * 1.05)
+    for _ in subset:
+        bounds.extend([(-limit, limit), (-limit, limit), (0.0, 360.0)])
+    
+    x0 = _flatten_solution(solution, subset)
+    
+    def objective(vec):
+        return _penalized_objective(vec, solution, subset, config)
+    
+    res = minimize(
+        objective,
+        x0,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": max(15, int(config.lbfgs_maxiter * (config.multi_resolution_shrink ** level)))}
+    )
+    
+    return _unflatten_solution(solution, res.x, subset)
+
+
+def _anneal_stage(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    iterations_multiplier: float,
+    level: int
+) -> List[Tuple[float, float, float]]:
+    """Run adaptive simulated annealing with level-scaled iterations."""
+    n_iter = int(
+        config.sa_iterations_base
+        * iterations_multiplier
+        * (1 + len(solution) / 100)
+        * (config.annealing_multiplier ** level)
+    )
+    return optimize_layout(len(solution), solution, n_iter, config, adaptive=True)
+
+
+def _hybrid_stage(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    iterations_multiplier: float,
+    level: int,
+    verbose: bool = False
+) -> List[Tuple[float, float, float]]:
+    """Single multi-resolution stage combining sweeps, DE, LBFGS, and annealing."""
+    working = center_placements(solution)
+    working = _rotation_sweep(working, config, level)
+    if config.use_differential_evolution:
+        working = _run_differential_evolution(working, config, level)
+    if config.use_lbfgs:
+        working = _run_lbfgs(working, config, level)
+    if config.use_annealing:
+        working = _anneal_stage(working, config, iterations_multiplier, level)
+    working = center_placements(working)
+    
+    if verbose:
+        score = compute_bounding_square_side(working)
+        print(f"    Level {level+1}: side={score:.4f}")
+    return working
+
+
+def _multi_resolution_pipeline(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    iterations_multiplier: float = 1.0,
+    verbose: bool = False
+) -> List[Tuple[float, float, float]]:
+    """Run multi-resolution hybrid optimization stack."""
+    working = list(solution)
+    for level in range(config.multi_resolution_levels):
+        working = _hybrid_stage(working, config, iterations_multiplier, level, verbose=verbose)
+    return working
+
+
+def _perturb_solution(solution: List[Tuple[float, float, float]], magnitude: float = 0.2) -> List[Tuple[float, float, float]]:
+    """Small random perturbation used for restarts."""
+    perturbed = []
+    for x, y, ang in solution:
+        perturbed.append((
+            x + random.uniform(-magnitude, magnitude),
+            y + random.uniform(-magnitude, magnitude),
+            (ang + random.uniform(-magnitude * 180, magnitude * 180)) % 360.0
+        ))
+    return perturbed
+
+
 def optimize_layout(
     num_trees: int,
     initial_positions: List[Tuple[float, float, float]],
     max_iterations: int = 5000,
-    config: Optional[OptimizationConfig] = None
+    config: Optional[OptimizationConfig] = None,
+    adaptive: bool = False
 ) -> List[Tuple[float, float, float]]:
     """
     Optimize layout using Simulated Annealing.
@@ -120,6 +369,8 @@ def optimize_layout(
     max_rotate = config.max_rotate
     
     T = T_initial
+    accept_count = 0
+    attempt_count = 0
     
     for iteration in range(max_iterations):
         # Pick random tree
@@ -176,6 +427,7 @@ def optimize_layout(
             # Improvement - always accept
             positions[i] = (new_x, new_y, new_ang)
             current_side = new_side
+            accept_count += 1
             
             if current_side < best_side:
                 best_side = current_side
@@ -185,14 +437,29 @@ def optimize_layout(
             if T > 0 and random.random() < math.exp(-delta / T):
                 positions[i] = (new_x, new_y, new_ang)
                 current_side = new_side
+                accept_count += 1
             else:
                 # Reject - revert
                 polys[i] = old_poly
+        attempt_count += 1
         
         # Update temperature and steps
         T *= cooling_rate
         max_shift = max(0.001, max_shift * config.shift_decay)
         max_rotate = max(0.1, max_rotate * config.rotate_decay)
+        
+        if adaptive and (iteration + 1) % 200 == 0 and attempt_count > 0:
+            acceptance_ratio = accept_count / attempt_count
+            if acceptance_ratio < 0.15:
+                T *= 0.85
+                max_shift *= 0.9
+                max_rotate *= 0.9
+            elif acceptance_ratio > 0.65:
+                T *= 1.15
+                max_shift *= 1.05
+                max_rotate *= 1.05
+            accept_count = 0
+            attempt_count = 0
     
     return best_positions
 
@@ -201,32 +468,21 @@ def optimize_with_restarts(
     num_trees: int,
     initial_positions: List[Tuple[float, float, float]],
     config: OptimizationConfig,
-    verbose: bool = False
+    verbose: bool = False,
+    iterations_multiplier: float = 1.0
 ) -> List[Tuple[float, float, float]]:
-    """Run SA with multiple restarts, return best result."""
+    """Run hybrid optimizer with multiple restarts, return best result."""
     
     best_solution = None
     best_score = float('inf')
     
     for restart in range(config.num_restarts):
         if restart == 0:
-            start = list(initial_positions)
+            start = center_placements(initial_positions)
         else:
-            # Perturb best solution found so far
-            start = list(best_solution) if best_solution else list(initial_positions)
-            for i in range(len(start)):
-                if random.random() < 0.4:
-                    x, y, deg = start[i]
-                    start[i] = (
-                        x + random.uniform(-0.15, 0.15),
-                        y + random.uniform(-0.15, 0.15),
-                        (deg + random.uniform(-45, 45)) % 360
-                    )
+            start = _perturb_solution(best_solution if best_solution else initial_positions, magnitude=0.25)
         
-        # Scale iterations by n for larger problems
-        n_iter = int(config.sa_iterations_base * (1 + num_trees / 100))
-        
-        result = optimize_layout(num_trees, start, n_iter, config)
+        result = _multi_resolution_pipeline(start, config, iterations_multiplier, verbose=False)
         score = compute_bounding_square_side(result)
         
         if score < best_score:
@@ -244,7 +500,7 @@ def optimize_placement(
     iterations_multiplier: float = 1.0,
     verbose: bool = False
 ) -> List[Tuple[float, float, float]]:
-    """Main optimization entry point."""
+    """Main optimization entry point using hybrid multi-resolution pipeline."""
     if config is None:
         config = OptimizationConfig.standard_mode()
     
@@ -254,8 +510,9 @@ def optimize_placement(
     
     random.seed(config.seed + n)
     
+    centered = center_placements(solution)
+    
     if config.num_restarts > 1:
-        return optimize_with_restarts(n, solution, config, verbose)
-    else:
-        n_iter = int(config.sa_iterations_base * iterations_multiplier * (1 + n / 100))
-        return optimize_layout(n, solution, n_iter, config)
+        return optimize_with_restarts(n, centered, config, verbose, iterations_multiplier)
+    
+    return _multi_resolution_pipeline(centered, config, iterations_multiplier, verbose)
