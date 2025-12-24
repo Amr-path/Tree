@@ -6,6 +6,7 @@ Key components:
 - L-BFGS-B local refinement on dense cores
 - Multi-resolution stages with angular sweeps for rotation discovery
 - Multi-restart capability with structured perturbations
+- Feasible global compaction via scaled line search + short anneal polish
 """
 import math
 import random
@@ -64,6 +65,12 @@ class OptimizationConfig:
     use_differential_evolution: bool = True
     use_lbfgs: bool = True
     use_annealing: bool = True
+    enable_global_compaction: bool = True
+    global_scale_floor: float = 0.35
+    global_scale_shrink: float = 0.82
+    global_scale_tolerance: float = 1e-4
+    global_scale_search_steps: int = 18
+    global_compaction_iterations: float = 0.45
     
     seed: int = 42
     
@@ -304,6 +311,23 @@ def _hybrid_stage(
     return working
 
 
+def _global_compaction_stage(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig,
+    level: int = 0
+) -> List[Tuple[float, float, float]]:
+    """Feasible radial compaction followed by a short anneal polish."""
+    compacted = _global_scale_search(solution, config)
+    if config.use_annealing and config.global_compaction_iterations > 0:
+        compacted = _anneal_stage(
+            compacted,
+            config,
+            iterations_multiplier=config.global_compaction_iterations,
+            level=level
+        )
+    return center_placements(compacted)
+
+
 def _multi_resolution_pipeline(
     solution: List[Tuple[float, float, float]],
     config: OptimizationConfig,
@@ -314,6 +338,9 @@ def _multi_resolution_pipeline(
     working = list(solution)
     for level in range(config.multi_resolution_levels):
         working = _hybrid_stage(working, config, iterations_multiplier, level, verbose=verbose)
+    
+    if config.enable_global_compaction:
+        working = _global_compaction_stage(working, config, level=config.multi_resolution_levels)
     return working
 
 
@@ -327,6 +354,66 @@ def _perturb_solution(solution: List[Tuple[float, float, float]], magnitude: flo
             (ang + random.uniform(-magnitude * 180, magnitude * 180)) % 360.0
         ))
     return perturbed
+
+
+def _scaled_solution(solution: List[Tuple[float, float, float]], scale: float) -> List[Tuple[float, float, float]]:
+    """Apply uniform scaling about origin."""
+    return [(x * scale, y * scale, ang) for x, y, ang in solution]
+
+
+def _is_feasible_scale(solution: List[Tuple[float, float, float]], scale: float) -> bool:
+    """Check if uniformly scaling placements remains overlap-free."""
+    if not solution:
+        return True
+    polys = []
+    for x, y, ang in solution:
+        poly = make_tree_polygon(x * scale, y * scale, ang)
+        if has_collision(poly, polys):
+            return False
+        polys.append(poly)
+    return True
+
+
+def _global_scale_search(
+    solution: List[Tuple[float, float, float]],
+    config: OptimizationConfig
+) -> List[Tuple[float, float, float]]:
+    """
+    Compact layout with a feasibility-preserving line search on global scale.
+    
+    Uses geometric progression to find an infeasible lower bound and then
+    bisects to the tightest collision-free scale. This replaces heuristic
+    radius shrinking with a mathematically controlled search.
+    """
+    if len(solution) <= 1 or not config.enable_global_compaction:
+        return solution
+    
+    upper = 1.0
+    lower = None
+    scale = upper * config.global_scale_shrink
+    
+    while scale >= config.global_scale_floor:
+        if _is_feasible_scale(solution, scale):
+            upper = scale
+            scale *= config.global_scale_shrink
+        else:
+            lower = scale
+            break
+    
+    # If still feasible at floor, return the tightest discovered scale.
+    if lower is None:
+        return center_placements(_scaled_solution(solution, upper))
+    
+    for _ in range(config.global_scale_search_steps):
+        mid = (upper + lower) / 2
+        if _is_feasible_scale(solution, mid):
+            upper = mid
+        else:
+            lower = mid
+        if abs(upper - lower) < config.global_scale_tolerance:
+            break
+    
+    return center_placements(_scaled_solution(solution, upper))
 
 
 def optimize_layout(
