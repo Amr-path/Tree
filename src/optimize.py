@@ -71,6 +71,22 @@ class OptimizationConfig:
     global_scale_tolerance: float = 1e-4
     global_scale_search_steps: int = 18
     global_compaction_iterations: float = 0.45
+    max_compaction_passes: int = 3
+    compaction_patience: int = 2
+    micro_rotation_steps: int = 32
+    micro_rotation_range: float = 35.0
+    coarse_relaxation_iterations: float = 0.35
+    coarse_relaxation_scale: float = 1.15
+    fine_relaxation_scale: float = 0.94
+    acceptance_target: float = 0.32
+    cooling_slowdown: float = 0.96
+    cooling_acceleration: float = 1.04
+    reheat_interval: int = 1200
+    reheat_factor: float = 0.55
+    elite_pool: int = 3
+    perturb_on_plateau: float = 0.18
+    angular_micro_decay: float = 0.75
+    angular_macro_decay: float = 0.9
     
     seed: int = 42
     
@@ -316,16 +332,54 @@ def _global_compaction_stage(
     config: OptimizationConfig,
     level: int = 0
 ) -> List[Tuple[float, float, float]]:
-    """Feasible radial compaction followed by a short anneal polish."""
-    compacted = _global_scale_search(solution, config)
-    if config.use_annealing and config.global_compaction_iterations > 0:
-        compacted = _anneal_stage(
-            compacted,
-            config,
-            iterations_multiplier=config.global_compaction_iterations,
-            level=level
-        )
-    return center_placements(compacted)
+    """Feasible radial compaction with multi-pass relaxation + polish."""
+    working = center_placements(solution)
+    best = working
+    best_side = compute_bounding_square_side(working)
+    stagnation = 0
+    
+    for pass_idx in range(config.max_compaction_passes):
+        # Relax outward slightly to allow re-interlocking, then compact
+        relaxed = _scaled_solution(working, config.coarse_relaxation_scale if pass_idx == 0 else 1.0)
+        relaxed = center_placements(relaxed)
+        relaxed = _global_scale_search(relaxed, config)
+        
+        # Angular sweep to tighten overlaps
+        relaxed = _rotation_sweep(relaxed, config, level=level)
+        if config.use_annealing and config.coarse_relaxation_iterations > 0:
+            relaxed = _anneal_stage(
+                relaxed,
+                config,
+                iterations_multiplier=config.coarse_relaxation_iterations,
+                level=level
+            )
+        
+        # Fine relaxation + short anneal
+        relaxed = _scaled_solution(relaxed, config.fine_relaxation_scale)
+        relaxed = _global_scale_search(relaxed, config)
+        
+        if config.use_annealing and config.global_compaction_iterations > 0:
+            relaxed = _anneal_stage(
+                relaxed,
+                config,
+                iterations_multiplier=config.global_compaction_iterations,
+                level=level
+            )
+        
+        relaxed = center_placements(relaxed)
+        side = compute_bounding_square_side(relaxed)
+        if side + 1e-6 < best_side:
+            best_side = side
+            best = relaxed
+            working = relaxed
+            stagnation = 0
+        else:
+            stagnation += 1
+            working = relaxed
+        if stagnation >= config.compaction_patience:
+            break
+    
+    return best
 
 
 def _multi_resolution_pipeline(
@@ -338,6 +392,10 @@ def _multi_resolution_pipeline(
     working = list(solution)
     for level in range(config.multi_resolution_levels):
         working = _hybrid_stage(working, config, iterations_multiplier, level, verbose=verbose)
+    
+    # Reverse-pass refinement (fine-to-coarse) to unlock new interlocks
+    for level in reversed(range(config.multi_resolution_levels)):
+        working = _hybrid_stage(working, config, iterations_multiplier * 0.55, level, verbose=False)
     
     if config.enable_global_compaction:
         working = _global_compaction_stage(working, config, level=config.multi_resolution_levels)
@@ -454,10 +512,13 @@ def optimize_layout(
     # Adaptive step sizes
     max_shift = config.max_shift_factor * current_side
     max_rotate = config.max_rotate
+    micro_rotate = min(config.micro_rotation_range, max_rotate)
     
     T = T_initial
     accept_count = 0
     attempt_count = 0
+    plateau_counter = 0
+    elite_best = best_side
     
     for iteration in range(max_iterations):
         # Pick random tree
@@ -500,6 +561,7 @@ def optimize_layout(
             T *= cooling_rate
             max_shift *= config.shift_decay
             max_rotate *= config.rotate_decay
+            micro_rotate = max(0.05, micro_rotate * config.angular_micro_decay)
             continue
         
         # Compute new score
@@ -519,6 +581,8 @@ def optimize_layout(
             if current_side < best_side:
                 best_side = current_side
                 best_positions = positions.copy()
+                plateau_counter = 0
+                elite_best = min(elite_best, best_side)
         else:
             # Worse - accept with probability
             if T > 0 and random.random() < math.exp(-delta / T):
@@ -534,19 +598,63 @@ def optimize_layout(
         T *= cooling_rate
         max_shift = max(0.001, max_shift * config.shift_decay)
         max_rotate = max(0.1, max_rotate * config.rotate_decay)
+        micro_rotate = max(0.05, micro_rotate * config.angular_micro_decay)
+        
+        # Periodic micro angular sweeps for interlocking
+        if (iteration + 1) % (max_iterations // 8 + 1) == 0:
+            sweep_steps = max(6, int(config.micro_rotation_steps * config.angular_macro_decay))
+            new_positions = list(positions)
+            new_polys = list(polys)
+            for idx, (x0, y0, a0) in enumerate(positions):
+                best_local = (x0, y0, a0)
+                best_side_local = current_side
+                for delta in np.linspace(-micro_rotate, micro_rotate, sweep_steps):
+                    candidate = (x0, y0, (a0 + delta) % 360.0)
+                    poly_candidate = make_tree_polygon(*candidate)
+                    others = new_polys[:idx] + new_polys[idx + 1:]
+                    if has_collision(poly_candidate, others):
+                        continue
+                    candidate_polys = list(new_polys)
+                    candidate_polys[idx] = poly_candidate
+                    side_candidate = bounding_square_side(candidate_polys)
+                    if side_candidate < best_side_local:
+                        best_side_local = side_candidate
+                        best_local = candidate
+                        new_positions[idx] = candidate
+                        new_polys[idx] = poly_candidate
+            positions = new_positions
+            polys = new_polys
+            current_side = bounding_square_side(polys)
+            if current_side < best_side:
+                best_side = current_side
+                best_positions = positions.copy()
+                elite_best = min(elite_best, best_side)
         
         if adaptive and (iteration + 1) % 200 == 0 and attempt_count > 0:
             acceptance_ratio = accept_count / attempt_count
-            if acceptance_ratio < 0.15:
-                T *= 0.85
-                max_shift *= 0.9
-                max_rotate *= 0.9
-            elif acceptance_ratio > 0.65:
-                T *= 1.15
+            if acceptance_ratio < config.acceptance_target:
+                T *= config.cooling_slowdown
+                max_shift *= config.shift_decay * 0.95
+                max_rotate *= config.rotate_decay * 0.95
+            elif acceptance_ratio > config.acceptance_target * 1.8:
+                T *= config.cooling_acceleration
                 max_shift *= 1.05
                 max_rotate *= 1.05
             accept_count = 0
             attempt_count = 0
+            plateau_counter += 1
+            if plateau_counter >= config.compaction_patience:
+                # inject controlled noise to escape plateaus
+                positions = _perturb_solution(best_positions, magnitude=config.perturb_on_plateau)
+                polys = [make_tree_polygon(x, y, a) for x, y, a in positions]
+                current_side = bounding_square_side(polys)
+                plateau_counter = 0
+        
+        # Controlled reheating to re-explore space
+        if adaptive and (iteration + 1) % max(config.reheat_interval, 1) == 0:
+            T = max(T, T_initial * config.reheat_factor)
+            max_shift = max_shift * 1.05
+            max_rotate = min(config.max_rotate, max_rotate * 1.05)
     
     return best_positions
 
@@ -562,6 +670,7 @@ def optimize_with_restarts(
     
     best_solution = None
     best_score = float('inf')
+    elite: List[Tuple[float, List[Tuple[float, float, float]]]] = []
     
     for restart in range(config.num_restarts):
         if restart == 0:
@@ -577,8 +686,20 @@ def optimize_with_restarts(
             best_solution = result
             if verbose:
                 print(f"    Restart {restart+1}: score={score:.4f}")
+        elite.append((score, result))
+        elite = sorted(elite, key=lambda x: x[0])[: config.elite_pool]
     
-    return best_solution if best_solution else initial_positions
+    # Final elite polish with stronger compaction
+    polished_best = best_solution if best_solution else initial_positions
+    polished_score = best_score
+    for score, candidate in elite:
+        refined = _global_compaction_stage(candidate, config, level=config.multi_resolution_levels + 1)
+        refined_score = compute_bounding_square_side(refined)
+        if refined_score < polished_score:
+            polished_score = refined_score
+            polished_best = refined
+    
+    return polished_best
 
 
 def optimize_placement(
