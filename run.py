@@ -44,7 +44,7 @@ def get_config(mode: str) -> OptimizationConfig:
         return OptimizationConfig.standard_mode()
 
 
-def main(mode: str = "standard", seed: int = 42, max_n: int = 200):
+def main(mode: str = "standard", seed: int = 42, max_n: int = 200, target_score: float = None):
     """Main solver entry point."""
     
     print("=" * 70)
@@ -53,6 +53,8 @@ def main(mode: str = "standard", seed: int = 42, max_n: int = 200):
     print(f"Mode: {mode}")
     print(f"Seed: {seed}")
     print(f"Max N: {max_n}")
+    if target_score is not None:
+        print(f"Target score: {target_score}")
     print()
     
     # Find data
@@ -78,7 +80,7 @@ def main(mode: str = "standard", seed: int = 42, max_n: int = 200):
     print(f"Solving n=1 to {max_n}...")
     print("-" * 50)
     
-    solver = PackingSolver(config=config, seed=seed)
+    solver = PackingSolver(config=config, seed=seed, target_score=target_score)
     solutions = solver.solve_all(max_n=max_n, verbose=True)
     
     solve_time = time.time() - start_time
@@ -137,9 +139,10 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max-n", type=int, default=200, help="Max N to solve")
+    parser.add_argument("--target-score", type=float, default=None, help="Goal for total score (triggers extra refinement)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(mode=args.mode, seed=args.seed, max_n=args.max_n)
+    main(mode=args.mode, seed=args.seed, max_n=args.max_n, target_score=args.target_score)
