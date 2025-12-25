@@ -196,6 +196,43 @@ def find_best_insertion_position(
     return (max_x + 0.8, (min_y + max_y) / 2, 0.0)
 
 
+def _repair_overlaps(placements: Solution, max_iters: int = 60, step: float = 0.06) -> Solution:
+    """
+    Resolve overlaps by gently repelling intersecting pairs.
+
+    This is a deterministic, low-overhead relaxation that preserves the
+    overall layout while guaranteeing an overlap-free configuration or
+    falling back to a safe hexagonal pattern.
+    """
+    if not placements:
+        return placements
+
+    current = list(placements)
+    for _ in range(max_iters):
+        overlaps = check_all_overlaps(current)
+        if not overlaps:
+            return center_placements(current)
+
+        adjustments = [(0.0, 0.0) for _ in current]
+        for i, j in overlaps:
+            xi, yi, ai = current[i]
+            xj, yj, aj = current[j]
+            dx, dy = xi - xj, yi - yj
+            dist = math.hypot(dx, dy) or 1.0
+            push = step / dist
+            ax, ay = dx * push, dy * push
+            adjustments[i] = (adjustments[i][0] + ax, adjustments[i][1] + ay)
+            adjustments[j] = (adjustments[j][0] - ax, adjustments[j][1] - ay)
+
+        current = [
+            (x + ax, y + ay, ang)
+            for (x, y, ang), (ax, ay) in zip(current, adjustments)
+        ]
+
+    # Fallback: guaranteed non-overlapping pattern
+    return center_placements(initial_hexagonal_positions(len(placements)))
+
+
 class PackingSolver:
     """
     Main solver using incremental building with SA optimization.
@@ -207,9 +244,16 @@ class PackingSolver:
     4. Periodically try fresh starts to escape local minima
     """
     
-    def __init__(self, config: Optional[OptimizationConfig] = None, seed: int = 42):
+    def __init__(
+        self,
+        config: Optional[OptimizationConfig] = None,
+        seed: int = 42,
+        target_score: Optional[float] = None
+    ):
         self.config = config or OptimizationConfig.standard_mode()
         self.seed = seed
+        self.target_score = target_score
+        self.target_per_tree: Optional[float] = None
         random.seed(seed)
         
         self.solutions: Dict[int, Solution] = {}
@@ -256,6 +300,39 @@ class PackingSolver:
             iterations_multiplier=iterations_mult,
             verbose=False
         )
+
+        def maybe_improve(current: Solution) -> Solution:
+            """Try alternative starts when we are above the target or stuck."""
+            current_score = compute_bounding_square_side(current)
+            per_tree_score = (current_score ** 2) / n
+            needs_help = self.target_per_tree and per_tree_score > self.target_per_tree
+
+            # Always allow a single alternative attempt for early trees to escape bad starts.
+            if not needs_help and n > 30:
+                return current
+
+            alternatives = [
+                initial_hexagonal_positions(n),
+                initial_brick_positions(n),
+                initial_spiral_positions(n),
+            ]
+
+            best_local = current
+            best_score_local = current_score
+            for alt in alternatives:
+                alt_opt = optimize_placement(
+                    alt,
+                    self.config,
+                    iterations_multiplier=iterations_mult * 0.6,
+                    verbose=False
+                )
+                alt_score = compute_bounding_square_side(alt_opt)
+                if alt_score < best_score_local:
+                    best_score_local = alt_score
+                    best_local = alt_opt
+            return best_local
+
+        optimized = maybe_improve(optimized)
         
         # Every 25 trees, try a fresh start to escape local minima
         if n % 25 == 0 and n > 25:
@@ -280,6 +357,7 @@ class PackingSolver:
         
         # Final centering
         optimized = center_placements(optimized)
+        optimized = _repair_overlaps(optimized)
         
         # Validate
         overlaps = check_all_overlaps(optimized)
@@ -302,12 +380,31 @@ class PackingSolver:
             print(f"Solving n=1 to {max_n}...")
             print(f"Config: {self.config.sa_iterations_base} base iterations, "
                   f"{self.config.num_restarts} restarts")
+
+        self.target_per_tree = (
+            self.target_score / max_n if self.target_score else None
+        )
+
+        def print_progress(n: int, side: float, total: float):
+            width = 30
+            filled = int(width * n / max_n)
+            bar = "█" * filled + "░" * (width - filled)
+            msg = (f"\r[{bar}] n={n}/{max_n} | side={side:.4f} "
+                   f"| running score={total:.2f}")
+            print(msg, end="", flush=True)
         
+        running_total = 0.0
         for n in range(1, max_n + 1):
             self.solve_single(n, verbose=verbose)
-        
+            side = self.scores[n]
+            running_total += (side ** 2) / n
+            if verbose:
+                print_progress(n, side, running_total)
         if verbose:
-            total = self.compute_total_score()
+            print()
+        
+        total = self.compute_total_score()
+        if verbose:
             print(f"\nTotal score: {total:.2f}")
         
         return self.solutions
