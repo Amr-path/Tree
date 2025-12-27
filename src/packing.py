@@ -150,27 +150,55 @@ def find_best_insertion_position(
     best_placement = None
     best_score = float('inf')
     
+    candidate_positions = []
+
     # Grid search around perimeter and inside
-    grid_size = 12
-    
     for gx in [min_x - margin] + list(range(int(min_x), int(max_x + 1))) + [max_x + margin]:
         for gy in [min_y - margin] + list(range(int(min_y), int(max_y + 1))) + [max_y + margin]:
-            # Convert to float
-            gx_f = float(gx) if isinstance(gx, int) else gx
-            gy_f = float(gy) if isinstance(gy, int) else gy
+            candidate_positions.append((float(gx), float(gy)))
+
+    # Random halo sampling to find tighter interlocks
+    for _ in range(24):
+        rx = random.uniform(min_x - margin, max_x + margin)
+        ry = random.uniform(min_y - margin, max_y + margin)
+        candidate_positions.append((rx, ry))
+
+    # Edge-biased candidates along the bounding box to reduce side length
+    offsets = [-0.35, -0.15, 0.15, 0.35]
+    for ox in offsets:
+        candidate_positions.append((max_x + margin + ox, (min_y + max_y) / 2))
+        candidate_positions.append((min_x - margin + ox, (min_y + max_y) / 2))
+    for oy in offsets:
+        candidate_positions.append(((min_x + max_x) / 2, max_y + margin + oy))
+        candidate_positions.append(((min_x + max_x) / 2, min_y - margin + oy))
+
+    # Local neighbor offsets around dense regions
+    neighbor_offsets = [
+        (TREE_WIDTH * 0.45, 0.0),
+        (-TREE_WIDTH * 0.45, 0.0),
+        (0.0, TREE_HEIGHT * 0.35),
+        (0.0, -TREE_HEIGHT * 0.35),
+    ]
+    dense_subset = sorted(existing, key=lambda p: abs(p[0]) + abs(p[1]))[:6]
+    for x0, y0, _ in dense_subset:
+        for dx, dy in neighbor_offsets:
+            candidate_positions.append((x0 + dx, y0 + dy))
+            candidate_positions.append((x0 + dx * 0.6, y0 + dy * 0.6))
+
+    # Evaluate candidates
+    for gx_f, gy_f in candidate_positions:
+        for deg in rotations:
+            poly = make_tree_polygon(gx_f, gy_f, deg)
             
-            for deg in rotations:
-                poly = make_tree_polygon(gx_f, gy_f, deg)
-                
-                if has_collision(poly, existing_polys):
-                    continue
-                
-                test_solution = existing + [(gx_f, gy_f, deg)]
-                score = compute_bounding_square_side(test_solution)
-                
-                if score < best_score:
-                    best_score = score
-                    best_placement = (gx_f, gy_f, deg)
+            if has_collision(poly, existing_polys):
+                continue
+            
+            test_solution = existing + [(gx_f, gy_f, deg)]
+            score = compute_bounding_square_side(test_solution)
+            
+            if score < best_score:
+                best_score = score
+                best_placement = (gx_f, gy_f, deg)
     
     # Finer grid search around best area
     if best_placement:
@@ -231,6 +259,36 @@ def _repair_overlaps(placements: Solution, max_iters: int = 60, step: float = 0.
 
     # Fallback: guaranteed non-overlapping pattern
     return center_placements(initial_hexagonal_positions(len(placements)))
+
+
+def _ensure_overlap_free(
+    placements: Solution,
+    n: int,
+    config: OptimizationConfig,
+    iterations_multiplier: float = 0.35
+) -> Solution:
+    """
+    Guarantee a non-overlapping layout with a guarded compaction pass.
+
+    The flow is:
+    1) Deterministic repel-based repair
+    2) Safety fallback to a structured hexagonal pattern if any overlaps remain
+    3) Short compaction pass to recover score without reintroducing overlaps
+    """
+    cleaned = _repair_overlaps(placements, max_iters=90, step=0.05)
+    if check_all_overlaps(cleaned):
+        cleaned = center_placements(initial_hexagonal_positions(n))
+
+    # Polishing pass: compact only if we can keep it overlap-free.
+    refined = optimize_placement(
+        cleaned,
+        config,
+        iterations_multiplier=iterations_multiplier,
+        verbose=False
+    )
+    if not check_all_overlaps(refined):
+        return center_placements(refined)
+    return center_placements(cleaned)
 
 
 class PackingSolver:
@@ -357,13 +415,24 @@ class PackingSolver:
         
         # Final centering
         optimized = center_placements(optimized)
-        optimized = _repair_overlaps(optimized)
+        optimized = _ensure_overlap_free(
+            optimized,
+            n,
+            self.config,
+            iterations_multiplier=iterations_mult * 0.4
+        )
         
         # Validate
         overlaps = check_all_overlaps(optimized)
         if overlaps:
             # Something went wrong, use safe fallback
             optimized = center_placements(initial_grid_positions(n))
+            optimized = _ensure_overlap_free(
+                optimized,
+                n,
+                self.config,
+                iterations_multiplier=iterations_mult * 0.25
+            )
         
         self.solutions[n] = optimized
         self.scores[n] = compute_bounding_square_side(optimized)
@@ -385,21 +454,45 @@ class PackingSolver:
             self.target_score / max_n if self.target_score else None
         )
 
-        def print_progress(n: int, side: float, total: float):
+        def print_progress(
+            n: int,
+            side: float,
+            total: float,
+            contrib: float,
+            avg_score: float,
+            overlaps: int,
+            best_side: float
+        ):
             width = 30
             filled = int(width * n / max_n)
             bar = "█" * filled + "░" * (width - filled)
-            msg = (f"\r[{bar}] n={n}/{max_n} | side={side:.4f} "
-                   f"| running score={total:.2f}")
+            msg = (
+                f"\r[{bar}] n={n:3d}/{max_n} | side={side:.4f} "
+                f"(best={best_side:.4f}) | contrib={contrib:.2f} "
+                f"| avg/step={avg_score:.2f} | overlaps={overlaps}"
+            )
             print(msg, end="", flush=True)
         
         running_total = 0.0
+        best_side_seen = float("inf")
         for n in range(1, max_n + 1):
             self.solve_single(n, verbose=verbose)
             side = self.scores[n]
-            running_total += (side ** 2) / n
+            contrib = (side ** 2) / n
+            running_total += contrib
+            best_side_seen = min(best_side_seen, side)
+            overlaps = len(check_all_overlaps(self.solutions[n]))
+            avg_score = running_total / n
             if verbose:
-                print_progress(n, side, running_total)
+                print_progress(
+                    n,
+                    side,
+                    running_total,
+                    contrib,
+                    avg_score,
+                    overlaps,
+                    best_side_seen
+                )
         if verbose:
             print()
         
